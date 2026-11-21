@@ -1,9 +1,13 @@
 import { div } from "gpui-kit";
-import { v_flex, h_flex } from "gpui-base";
-import { focused, terminals, appHome, exec, shared, setShared, openOverlay, closeOverlay, theme } from "herdr";
+import { quotaSegment, quotaPanel } from "./quota-view.js";
+import { h_flex } from "gpui-base";
+import { focused, terminals, appHome, exec, shared, setShared, openOverlay, closeOverlay } from "herdr";
 
 export const names = { codex: "Codex", cursor: "Cursor", agy: "Agy", claude: "Claude Code" };
 const preference = "workspace.usage.providers";
+const localQuotas = new Set(["agy", "claude"]);
+const quotaInterval = 60000;
+const outputWindow = 12000;
 const resumeFlags = { codex: ["resume"], cursor: ["--resume"], agy: ["--conversation"], claude: ["--resume", "--session-id"] };
 const UUID = /^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i;
 
@@ -36,116 +40,221 @@ function enabled() {
   return Array.isArray(value) ? value.filter(key => Object.prototype.hasOwnProperty.call(names, key)) : [];
 }
 
-function keyFor(provider, selected) {
-  return provider === selected.provider ? JSON.stringify([selected.terminal, selected.id]) : "";
+function selectionKey({ provider, terminal, id }) {
+  return provider ? JSON.stringify([provider, terminal, id]) : "";
 }
 
-function selectedSession(rows, selected, active) {
-  if (!active.includes(selected.provider)) return null;
-  const row = rows[selected.provider];
-  return row?.key === keyFor(selected.provider, selected) ? row.session : null;
+function quotaTarget(provider, selected) {
+  return localQuotas.has(provider) && provider === selected.provider ? selected : {};
 }
 
-function reading(w) {
-  return Math.round(w.remaining) + "%" + (w.resetAt <= Date.now() || Date.now() - w.observedAt > 900000 ? " (stale)" : "");
+function selectedSession(sample, selected, active) {
+  return active.includes(selected.provider) && sample?.key === selectionKey(selected) ? sample.session : null;
 }
 
-function sessionText(s) {
-  if (!s) return "Session unavailable";
-  const parts = [s.model, Number.isFinite(s.turns) && s.turns + (s.turns === 1 ? " turn" : " turns"),
-    Number.isFinite(s.tokens) && s.tokens.toLocaleString() + " tokens"].filter(Boolean);
-  return parts.join(" · ") || "Session " + String(s.id).slice(0, 8);
+const unknown = "—";
+function number(n) {
+  return Number.isFinite(n) ? String(n).replace(/\B(?=(\d{3})+(?!\d))/g, ",") : unknown;
+}
+
+function detailText(s) {
+  const context = Number.isFinite(s.contextInputTokens) && s.contextWindow > 0
+    ? number(s.contextInputTokens) + "/" + number(s.contextWindow) + " (" + Math.round(100 * s.contextInputTokens / s.contextWindow) + "%)"
+    : Number.isFinite(s.contextPercent) ? number(s.contextPercent) + "%" : unknown;
+  return [
+    s.model || "Model " + unknown,
+    number(s.turns) + (s.turns === 1 ? " turn" : " turns"),
+    "Total " + number(s.tokens) + " tokens",
+    "In " + number(s.inputTokens),
+    "Out " + number(s.outputTokens),
+    "Cached " + number(s.cacheTokens),
+    "Model calls " + number(s.modelCalls),
+    "Tool calls " + number(s.toolCalls),
+    "Context " + context,
+    "TTFT " + (Number.isFinite(s.ttftMs) ? number(s.ttftMs) + " ms" : unknown),
+  ].join(" · ");
+}
+
+function inlineMetrics(session) {
+  const amount = session?.costUsd;
+  const source = { provider: "Reported", standard: "Standard API est.", configured: "Configured est." }[session?.costSource];
+  let cost = "USD " + unknown;
+  if (Number.isFinite(amount) && source) {
+    const dollars = amount > 0 && amount < 0.0001
+      ? "<$0.0001" : "$" + amount.toFixed(4).replace(/(\.\d{2}\d*?)0+$/, "$1");
+    cost = source + " " + dollars;
+  }
+  const hit = session?.cacheHitRate;
+  const rate = session?.outputRate;
+  return [
+    number(session?.tokens) + " tokens",
+    cost,
+    "Cache hit " + (Number.isFinite(hit) ? hit.toFixed(1) + "%" : unknown),
+    (rate === 0 ? "idle" : Number.isFinite(rate) ? rate.toFixed(1) : unknown) + " tok/s",
+  ].join(" · ");
+}
+
+// Compare observed cumulative output across a short window. Reset on a
+// discontinuity, including a different transcript for the same session ID.
+function observeOutput(previous, session, generation, at) {
+  if (!Number.isFinite(session?.outputTokens)) return null;
+  const sample = { at, tokens: session.outputTokens };
+  const series = previous?.id === session.id && previous.generation === generation ? previous : null;
+  const last = series?.samples.at(-1);
+  if (!last || at <= last.at || at - last.at >= outputWindow || sample.tokens < last.tokens) {
+    return { id: session.id, generation, samples: [sample], lastGrowth: null };
+  }
+  const samples = series.samples.filter(point => at - point.at < outputWindow);
+  const first = samples[0] ?? last;
+  const lastGrowth = sample.tokens > last.tokens ? at : series.lastGrowth;
+  const rate = lastGrowth != null && at - lastGrowth < outputWindow
+    ? (sample.tokens - first.tokens) * 1000 / (at - first.at) : 0;
+  return { ...series, samples: [...samples, sample], lastGrowth, rate };
+}
+
+async function collect(action, provider, selected) {
+  const args = [appHome() + "/mods/workspace-status/usage.cjs", action, provider];
+  if (selected.terminal) args.push(selected.terminal, selected.id);
+  const response = await exec("node", args, { timeout: 22000 });
+  if (response.code !== 0) throw Error();
+  return JSON.parse(response.stdout);
 }
 
 export class Usage {
   constructor() {
-    this.rows = {};
-    this.busy = new Set();
+    this.quotas = {};
+    this.quotaBusy = new Set();
+    this.session = null;
+    this.sessionBusy = false;
+    this.key = "";
   }
 
   refresh(cx) {
     const active = enabled();
-    if (!active.length) { this.rows = {}; return; }
     const selected = selection();
-    for (const provider of Object.keys(names)) {
-      if (!active.includes(provider)) {
-        delete this.rows[provider];
-        continue;
-      }
-      const key = keyFor(provider, selected);
-      const previous = this.rows[provider];
-      if (this.busy.has(provider) || (previous?.key === key && Date.now() - previous.at < 60000)) continue;
-      this.busy.add(provider);
+    const key = active.includes(selected.provider) ? selectionKey(selected) : "";
+    if (this.key !== key) {
+      this.key = key;
+      this.session = null;
+      cx.notify();
+    }
+    const current = this.session?.output;
+    if (current?.rate > 0 && Date.now() - current.lastGrowth >= outputWindow) {
+      current.rate = 0;
+      this.session.session.outputRate = 0;
+      cx.notify();
+    }
+    if (key && !this.sessionBusy) {
+      this.sessionBusy = true;
       cx.spawn(async cx => {
         let value;
         try {
-          const args = [appHome() + "/mods/workspace-status/usage.cjs", "read", provider];
-          if (key) args.push(selected.terminal, selected.id);
-          const result = await exec("node", args, { timeout: 22000 });
-          if (result.code !== 0) throw Error();
-          value = JSON.parse(result.stdout);
+          value = await collect("sample", selected.provider, selected);
+        } catch {
+          value = { session: null };
+        } finally {
+          this.sessionBusy = false;
+        }
+        if (selectionKey(selection()) !== key || this.key !== key || !enabled().includes(selected.provider)) return;
+        const output = observeOutput(this.session?.output, value.session, value.generation, value.observedAt ?? Date.now());
+        this.session = {
+          key, output,
+          session: value.session && { ...value.session, outputRate: output?.rate },
+        };
+        cx.notify();
+      });
+    }
+
+    for (const provider of Object.keys(names)) {
+      if (!active.includes(provider)) {
+        delete this.quotas[provider];
+        continue;
+      }
+      const target = quotaTarget(provider, selected);
+      const quotaKey = selectionKey(target);
+      const previous = this.quotas[provider];
+      if (this.quotaBusy.has(provider) || (previous?.key === quotaKey && Date.now() - previous.at < quotaInterval)) continue;
+      this.quotaBusy.add(provider);
+      cx.spawn(async cx => {
+        let value;
+        try {
+          value = await collect("quota", provider, target);
         } catch {
           value = { windows: [], error: "Collector unavailable. Check Node.js and provider setup." };
         } finally {
-          this.busy.delete(provider);
+          this.quotaBusy.delete(provider);
         }
         if (!enabled().includes(provider)) return;
-        this.rows[provider] = { ...value, at: Date.now(), key };
+        if (selectionKey(quotaTarget(provider, selection())) !== quotaKey) return;
+        this.quotas[provider] = { ...value, at: Date.now(), key: quotaKey };
         cx.notify();
       });
     }
   }
 
-  button(compact) {
+  button() {
     const selected = selection();
     const active = enabled();
-    const session = selectedSession(this.rows, selected, active);
-    const labels = [];
-    if (session) labels.push(sessionText(session));
-    for (const id of active) {
-      const row = this.rows[id];
-      const first = row?.key === keyFor(id, selected) && row.windows?.[0];
-      if (first) labels.push(names[id] + " " + first.label + " " + reading(first) + " left");
+    const session = selectedSession(this.session, selected, active);
+    const open = provider => openOverlay({
+      mod: "workspace-status", kind: "dialog", width: 500, height: 425,
+      props: { details: true, provider, quotas: this.quotas, sample: this.session, selected },
+    });
+    const bar = h_flex().flex_none().gap(14).items_center();
+    if (active.includes(selected.provider) || !active.length) {
+      const text = active.includes(selected.provider) ? inlineMetrics(session) : "Usage";
+      bar.child(div().id("workspace-usage").cursor_pointer().whitespace_nowrap()
+        .tooltip("Session usage · output tokens/s updates as new usage is reported")
+        .on_click(() => open(selected.provider)).child(text));
     }
-    const text = compact ? (labels[session ? 1 : 0] || labels[0] || "Usage") : (labels.join("   ·   ") || "Usage");
-    return div().id("workspace-usage").cursor_pointer().overflow_hidden().whitespace_nowrap()
-      .tooltip("Session and local subscription usage").on_click(() => openOverlay({
-        mod: "workspace-status", kind: "dialog", width: 460, height: 350,
-        props: { details: true, rows: this.rows, selected },
-      })).child(text);
+    for (const id of active) {
+      const row = this.quotas[id];
+      bar.child(quotaSegment({ id, name: names[id], row: row?.key === selectionKey(quotaTarget(id, selected)) ? row : null,
+        onClick: () => open(id) }));
+    }
+    return bar;
   }
 }
 
-export function details({ rows = {}, selected = {}, overlay }) {
-  const t = theme();
+export function details({ provider, quotas = {}, sample, selected = {}, overlay }, view = {}) {
   const active = enabled();
-  const session = selectedSession(rows, selected, active);
-  const line = (text) => div().text_size(12).text_color(t.muted).child(text);
-  const content = v_flex().gap(8).p(16).text_color(t.foreground)
-    .child(div().font_semibold().child("Current session"))
-    .child(line(selected.provider ? names[selected.provider] + " · " + sessionText(session) : "No local agent focused"));
-  if (session) {
-    for (const [field, label] of [["inputTokens", "Input"], ["outputTokens", "Output"], ["cacheTokens", "Cached"]]) {
-      if (Number.isFinite(session[field])) content.child(line(label + " · " + session[field].toLocaleString()));
-    }
+  const session = selectedSession(sample, selected, active);
+  const selectedId = view.selectedProvider || provider || active[0] || "codex";
+  const providers = Object.entries(names).map(([id, name]) => {
+    const row = view.freshQuotas?.[id] ?? quotas[id];
+    return { id, name, on: active.includes(id), row: row?.key === selectionKey(quotaTarget(id, selected)) ? row : null };
+  });
+  function refresh(id, cx) {
+    view.pendingQuotas ??= new Set();
+    if (view.pendingQuotas.has(id)) return;
+    view.pendingQuotas.add(id);
+    cx.spawn(async cx => {
+      const target = quotaTarget(id, selected);
+      let value;
+      try { value = await collect("quota", id, target); }
+      catch { value = { windows: [], error: "Collector unavailable" }; }
+      view.pendingQuotas.delete(id);
+      view.freshQuotas ??= {};
+      view.freshQuotas[id] = { ...value, at: Date.now(), key: selectionKey(target) };
+      cx.notify();
+    });
   }
-  content.child(div().pt(8).font_semibold().child("Local subscriptions"));
-  for (const [id, name] of Object.entries(names)) {
-    const on = active.includes(id);
-    content.child(h_flex().items_center().child(div().flex_1().child(name))
-      .child(div().id("enable-" + id).cursor_pointer().text_color(t.accent)
-        .on_click(() => {
-          setShared(preference, on ? active.filter(p => p !== id) : [...active, id]);
-          closeOverlay(overlay);
-        })
-        .child(on ? "Disable" : "Enable")));
-    if (!on) continue;
-    const row = rows[id]?.key === keyFor(id, selected) ? rows[id] : null;
-    if (!row?.windows?.length) content.child(line(row?.error || (row ? "Quota unavailable" : "Waiting for usage data")));
-    for (const w of row?.windows || []) {
-      const reset = w.resetAt ? " · resets " + new Date(w.resetAt).toLocaleString() : "";
-      content.child(line(w.label + " · " + reading(w) + " remaining" + reset));
-    }
-  }
-  return v_flex().size_full().bg(t.popover).child(v_flex().id("usage-scroll").flex_1().min_h(0).overflow_y_scroll().child(content));
+  return quotaPanel({
+    providers, selectedId, onRefresh: refresh,
+    sessionSummary: session ? inlineMetrics(session) : selected.provider ? "Session unavailable" : "No local agent focused",
+    sessionDetail: session ? detailText(session) : "",
+    onSelect: (id, cx) => { view.selectedProvider = id; cx.notify(); },
+    onToggle: (id, cx) => {
+      const ids = enabled();
+      if (ids.includes(id)) {
+        setShared(preference, ids.filter(p => p !== id));
+        cx.notify();
+        return;
+      }
+      setShared(preference, [...ids, id]);
+      cx.notify();
+      refresh(id, cx);
+    },
+    onClose: () => closeOverlay(overlay),
+  });
 }

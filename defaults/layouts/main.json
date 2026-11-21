@@ -171,7 +171,7 @@
           "id": "status",
           "type": "block",
           "size": {
-            "px": 28
+            "px": 32
           },
           "content": {
             "mod": "workspace-status"

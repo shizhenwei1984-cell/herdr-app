@@ -3,8 +3,14 @@
 - Click **Usage** in the Herdr status bar, then click **Enable** for each provider you want to track.
 - Install Node.js 18 or later on the app’s `PATH`.
 - The bar shows local subscriptions and the focused local session.
-- Enabled providers refresh once a minute and when terminal focus changes. Missing metrics appear as unavailable.
-- Replace `/absolute/path/to/workspace-status` with the absolute path to `mods/workspace-status` in your Herdr app home (normally `~/.config/herdr-app`).
+- The session bar shows total tokens, cost in USD, the percentage of input tokens served from cache and observed output tokens per second. A dash (`—`) marks an unavailable metric.
+- Click a provider icon to open its quota panel. Switch between **Remaining** and **Used** to change the bar and panel together. The panel shows every quota window, its reset time and the most recent update.
+- Click the session reading to view model, turns, token breakdown (input, output, cache), model and tool call counts, context use, and TTFT where available, alongside subscription quota windows.
+- The bar samples new output about every 2.5 seconds. The rolling rate settles to `idle` when output pauses. Codex writes usage in batches, so readings can update after a response finishes. Subscription limits refresh separately.
+- The cost label identifies its source. For supported Codex models the bar estimates the API equivalent using Standard short-context prices per million tokens. [OpenAI API pricing](https://developers.openai.com/api/docs/pricing)
+  - `gpt-6.2-astra`: input `$8`, cache read `$0.40`, output `$40`, 30m cache write `$10`
+  - `gpt-6.2-sol`: input `$2`, cache read `$0.10`, output `$10`, 30m cache write `$2.50`
+- Replace `/absolute/path/to/workspace-status` with the absolute path to `mods/workspace-status` in your Herdr app home (`<appHome>`, normally `~/.config/herdr-app` or `$HERDR_APP_HOME`).
 
 ## Codex
 
@@ -48,7 +54,7 @@ node "/absolute/path/to/workspace-status/usage.cjs" bind codex
 
 ## Agy
 
-- Add `statusLine` with `stack_with_default: true`:
+- Add `statusLine` to `~/.gemini/antigravity-cli/settings.json`. Keep the default status line with `stack_with_default`.
 
 ```json
 {
@@ -78,7 +84,8 @@ node "/absolute/path/to/workspace-status/usage.cjs" bind codex
 }
 ```
 
-- **Billing**: Cursor performs no automatic login credential discovery.
-  - **Preferred**: Save the JSON from signed-in `https://cursor.com/api/usage-summary` and set `HERDR_CURSOR_USAGE_FILE=/absolute/path/to/usage-summary.json`.
-  - **Alternative**: In a trusted app environment, explicitly set `HERDR_CURSOR_USAGE_COOKIE="WorkosCursorSessionToken=..."`.
-- Displays session `model` and `turns` when available.
+- **Billing**: With Cursor enabled, Herdr uses the local Cursor CLI login from its auth.json to refresh the dashboard quota every minute. It sends the session only to cursor.com and keeps it in memory.
+  - **Fallback when the CLI login file has no token**: Save the JSON from signed-in `https://cursor.com/api/usage-summary` to `<appHome>/usage/cursor/billing.json` (no restart and no environment variable needed).
+  - **Custom file**: Set `HERDR_CURSOR_USAGE_FILE=/absolute/path/to/usage-summary.json`.
+  - **Session cookie**: In a trusted app environment, explicitly set `HERDR_CURSOR_USAGE_COOKIE="WorkosCursorSessionToken=..."`.
+- Displays session `model` and `turns` in the popup when available.

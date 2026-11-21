@@ -16,10 +16,13 @@ async function main([action, provider, terminal, sessionId]) {
     execFileSync("hc", ["label", address, "workspace.usage=" + provider + "/" + id]);
     return;
   }
-  if (action !== "read") throw Error("Expected read or bind");
-  const { collect } = require("./" + provider + "-usage.cjs");
+  if (!["read", "quota", "sample"].includes(action)) throw Error("Expected read, quota, sample or bind");
+  const adapter = require("./" + provider + "-usage.cjs");
+  const collect = action === "read" ? adapter.collect : adapter[action];
   const appHome = require("node:path").resolve(__dirname, "../..");
   const result = await collect({ appHome, terminal: terminal || null, sessionId: sessionId || null });
+  if (result.session) await require("./usage-pricing.cjs").priceSession(provider, result.session, appHome);
+  if (action === "sample") result.observedAt ??= Date.now();
   process.stdout.write(JSON.stringify(result));
 }
 

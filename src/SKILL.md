@@ -6,7 +6,7 @@ what the person sees. For starting, reading, messaging, waiting on or cleaning
 up agents and programs, read `hc --skill` and use hc.
 Your terminal address is `$HC_TERMINAL_ID`; it is not a pane ID.
 
-Click **Usage** in the Herdr status bar to enable local subscription tracking per provider and view focused local session metrics alongside remaining quota windows. See `mods/workspace-status/README.md` in the app home for provider setup.
+Click **Usage** in the Herdr status bar to enable local subscription tracking per provider and view remaining quota windows alongside the focused session’s four bar metrics (total tokens, provider-reported or estimated API-equivalent USD cost, cache read hit % of input tokens, and live observed output tokens/s; `—` when missing). Click **Usage** for the popup with model, turns, token breakdown, model/tool call counts, context use, and TTFT where available. See `mods/workspace-status/README.md` in the app home for provider setup.
 
 ## Inspect before acting
 

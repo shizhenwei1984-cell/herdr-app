@@ -189,7 +189,14 @@ parentheses and apostrophes, and preserves Unicode file and folder names
 only when expanded.
 
 Click **Usage** in the default status bar to enable local Codex, Cursor, Agy or Claude Code
-quota and focused-session metrics. Provider setup is in `mods/workspace-status/README.md`.
+quota and focused-session metrics. The status bar's session area shows four metrics only—total
+tokens, USD amount (provider-reported or estimated at Standard API-equivalent rates, not a
+subscription charge), cache read hit % of input tokens, and live observed output tokens/s—with
+a dash for missing values. Click a provider in the bar to see all its quota windows, reset
+countdowns, and refresh action. Agy also shows all Gemini and third-party windows inline. Switch between **Remaining** and **Used** in the dialog
+to change both views. Click **Usage** for details on model, turns, token breakdown,
+model/tool call counts, context use, and TTFT where available. Cursor quota refreshes automatically with a file-backed Cursor CLI login. Its On-demand amount is personal spend for the billing cycle. Provider setup is in
+`mods/workspace-status/README.md`.
 
 **Herdr's own layouts and mods are read-only.** They are replaced whole
 on every start. Use settings.json for look (fonts, sizes, theme, colors,

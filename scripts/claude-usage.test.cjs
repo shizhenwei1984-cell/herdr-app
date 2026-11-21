@@ -31,12 +31,16 @@ test("Claude reports only the bound session, counting repeated streaming blocks 
   const id = "f4643693-dece-4243-bb3c-29f873cfab49";
   const user = { sessionId: id, type: "user", uuid: "u", message: { content: [{ type: "text", text: "hello" }] } };
   const assistant = { sessionId: id, type: "assistant", requestId: "r", message: {
-    id: "m", model: "example", usage: { input_tokens: 10, output_tokens: 2, cache_read_input_tokens: 3 }
+    id: "m", model: "example", content: [{ type: "tool_use", id: "tool-a", input: { secret: "fixture" } }],
+    usage: { input_tokens: 10, output_tokens: 2, cache_read_input_tokens: 3 }
   } };
   const rows = [user, user, { ...user, uuid: "tool", message: { content: [{ type: "tool_result" }] } },
     assistant, assistant, { ...assistant, sessionId: "unrelated" }, { ...assistant, isSidechain: true }];
   await fs.writeFile(path.join(dir, id + ".jsonl"), rows.map(r => JSON.stringify(r)).join("\n") + "\n{");
-  assert.deepEqual((await collect({ home, configDir, appHome: home, sessionId: id })).session, { id, turns: 1, model: "example", inputTokens: 10, outputTokens: 2, cacheTokens: 3, tokens: 15 });
+  assert.deepEqual((await collect({ home, configDir, appHome: home, sessionId: id })).session, {
+    id, turns: 1, model: "example", inputTokens: 10, outputTokens: 2, cacheTokens: 3,
+    cacheReadTokens: 3, tokens: 15, modelCalls: 1, toolCalls: 1, pricingModel: "example",
+  });
   assert.equal((await collect({ home, configDir })).session, null);
   assert.equal((await collect({ home, configDir, appHome: home, sessionId: "../escape" })).session, null);
 });
@@ -47,7 +51,7 @@ test("Claude status line forwards JSON intact and associates custom profiles onl
   t.after(() => fs.rm(home, { recursive: true, force: true }));
   const mod = path.join(home, "mods", "workspace-status");
   await fs.mkdir(mod, { recursive: true });
-  for (const name of ["claude-usage.cjs", "usage-hook.cjs"]) {
+  for (const name of ["claude-usage.cjs", "usage-hook.cjs", "usage.cjs", "usage-pricing.cjs"]) {
     await fs.copyFile(require.resolve("../defaults/mods/workspace-status/" + name), path.join(mod, name));
   }
   const helper = path.join(mod, "claude-usage.cjs");
@@ -55,9 +59,13 @@ test("Claude status line forwards JSON intact and associates custom profiles onl
   await fs.mkdir(configDir, { recursive: true });
   const id = "f4643693-dece-4243-bb3c-29f873cfab49";
   const filename = path.join(configDir, id + ".jsonl");
-  const event = { sessionId: id, type: "assistant", message: { id: "msg1", model: "test", usage: { output_tokens: 3 } } };
+  const event = { sessionId: id, type: "assistant", message: { id: "msg1", model: "test",
+    usage: { input_tokens: 12, output_tokens: 3, cache_read_input_tokens: 10, cache_creation_input_tokens: 3 },
+  } };
   await fs.writeFile(filename, JSON.stringify(event) + "\n");
   const line = { session_id: id, model: { display_name: "Test" }, transcript_path: filename,
+    cost: { total_cost_usd: 0.371 },
+    context_window: { context_window_size: 100, current_usage: event.message.usage },
     rate_limits: { five_hour: { used_percentage: 27.5, resets_at: 1795281577 } } };
   const input = JSON.stringify(line, null, 2) + "\n";
   const child = spawnSync(process.execPath, [helper, "status-line", "--passthrough"], {
@@ -70,7 +78,20 @@ test("Claude status line forwards JSON intact and associates custom profiles onl
   assert.equal(result.windows.length, 1);
   assert.equal(result.windows[0].remaining, 72.5);
   assert.equal(result.windows[0].resetAt, 1795281577000);
-  assert.equal(result.session.tokens, 3);
+  assert.equal(result.session.tokens, 28);
+  const sample = address => JSON.parse(spawnSync(process.execPath, [path.join(mod, "usage.cjs"), "sample", "claude", address], {
+    encoding: "utf8", env: { ...process.env, HOME: home, USERPROFILE: home, CLAUDE_CONFIG_DIR: configDir },
+  }).stdout).session;
+  assert.equal(sample("t2"), null);
+  await fs.writeFile(path.join(home, "usage", "pricing.json"), JSON.stringify({
+    test: { input: 10, cached_input: 1, output: 20, cache_write: 25 },
+  }));
+  const metrics = sample("t1");
+  assert.equal(metrics.costUsd, 0.371);
+  assert.equal(metrics.costSource, "provider");
+  assert.equal(metrics.cacheHitRate, 40);
+  assert.equal(metrics.contextInputTokens, 25);
+  assert.equal(metrics.contextWindow, 100);
   assert.deepEqual(await collect({ ...options, terminal: "t2" }), { windows: [], session: null });
 
   // The summary survives collector process restarts and changes when the transcript grows.

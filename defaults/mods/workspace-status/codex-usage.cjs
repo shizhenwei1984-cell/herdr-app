@@ -1,6 +1,9 @@
 const { spawn } = require("node:child_process");
 const fs = require("node:fs/promises");
 const { createInterface } = require("node:readline");
+const path = require("node:path");
+const os = require("node:os");
+const { summarizeLog } = require("./usage-hook.cjs");
 
 const uuid = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i;
 
@@ -29,51 +32,136 @@ function quotaWindows(result) {
   return windows;
 }
 
-// A token_count contains a cumulative snapshot. Bound disk I/O on every poll
-// even when one thread contains months of tool output.
-async function readSession(thread, id) {
-  if (!thread || thread.id !== id) return null;
-  const session = { id };
-  if (thread.model) session.model = thread.model;
-  if (!thread.path) return session;
-  const file = await fs.open(thread.path, "r").catch(() => null);
-  if (!file) return session;
-  try {
-    const stat = await file.stat();
-    if (!stat.isFile()) return session;
-    const size = Math.min(stat.size, 2 * 1024 * 1024);
-    const buffer = Buffer.alloc(size);
-    const { bytesRead } = await file.read(buffer, 0, size, stat.size - size);
-    const lines = buffer.toString("utf8", 0, bytesRead).split("\n");
-    if (size < stat.size) lines.shift();
-    const turns = new Set();
-    for (const line of lines) {
-      if (!line.includes('"token_count"') && !line.includes('"turn_context"') && !line.includes('"token_usage_record"')) continue;
-      let event;
-      try { event = JSON.parse(line); } catch { continue; }
-      const payload = event?.payload;
-      if (event?.type === "turn_context" && payload?.turn_id) turns.add(payload.turn_id);
-      const usage = event?.type === "token_usage_record" ? payload?.thread_token_usage
-        : event?.type === "event_msg" && payload?.type === "token_count" ? payload.info?.total_token_usage : null;
-      if (usage) {
-        for (const [field, key] of Object.entries({
-          total_tokens: "tokens", input_tokens: "inputTokens",
-          output_tokens: "outputTokens", cached_input_tokens: "cacheTokens",
-        })) {
-          if (Number.isSafeInteger(usage[field]) && usage[field] >= 0) session[key] = usage[field];
-        }
-      }
-    }
-    // A tail cannot tell how many earlier turns were omitted.
-    if (size === stat.size && turns.size) session.turns = turns.size;
-  } finally {
-    await file.close();
-  }
-  return session;
+const tokenFields = {
+  total_tokens: "tokens", input_tokens: "inputTokens",
+  output_tokens: "outputTokens", cached_input_tokens: "cacheTokens",
+  cache_write_input_tokens: "cacheWriteTokens",
+};
+const rolloutName = /^rollout-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-([a-f0-9-]{36})(?:_[a-f0-9-]{36})?\.jsonl$/i;
+const toolItems = new Set(["function_call", "custom_tool_call", "tool_search_call", "local_shell_call"]);
+const count = value => Number.isSafeInteger(value) && value >= 0;
+const hasId = value => typeof value === "string" && value.length > 0;
+
+function recordContext(session, latest, contextWindow) {
+  if (count(contextWindow) && contextWindow > 0) session.contextWindow = contextWindow;
+  // Codex can fill a context-only estimate into last_token_usage.
+  if (latest?.input_tokens === 0 && latest.output_tokens === 0 && latest.total_tokens > 0) return;
+  if (count(latest?.input_tokens)) session.contextInputTokens = latest.input_tokens;
 }
 
-async function collect({ sessionId } = {}) {
-  const id = typeof sessionId === "string" && uuid.test(sessionId) ? sessionId : null;
+function observeUsage(state, total) {
+  if (!total) return;
+  const changed = Object.entries(tokenFields).some(([field, key]) => count(total[field]) && state.session[key] !== total[field]);
+  for (const [field, key] of Object.entries(tokenFields)) {
+    if (count(total[field])) state.session[key] = total[field];
+    else delete state.session[key];
+  }
+  if (!changed || (total.input_tokens === 0 && total.output_tokens === 0)) return;
+  const model = state.session.model;
+  if (!model || (state.pricingModel && state.pricingModel !== model)) state.ambiguousModel = true;
+  else state.pricingModel = model;
+  if (Object.keys(tokenFields).some(field => field !== "cache_write_input_tokens" && !count(total[field]))) {
+    state.incompleteUsage = true;
+  }
+}
+
+function reducer(id) {
+  return {
+    initial: () => ({ matched: false, session: { id }, turns: {}, responses: {}, tools: {} }),
+    fold(state, row) {
+      const p = row?.payload;
+      if (!p) return;
+      if (row.type === "session_meta") {
+        state.matched = p.id === id;
+        return;
+      }
+      if (!state.matched) return;
+      const { session, turns, responses, tools } = state;
+      if (row.type === "token_usage_record" && (!p.thread_id || p.thread_id === id)) {
+        if (hasId(p.response_id)) responses["#" + p.response_id] = true;
+        if (hasId(p.turn_id)) turns["#" + p.turn_id] = true;
+        const total = p.thread_token_usage;
+        if (total) {
+          // An older session can gain token_usage_record after a CLI upgrade.
+          // Keep the legacy totals if the new counter started partway through.
+          state.useRecords ??= !count(session.tokens) || total.total_tokens >= session.tokens;
+          if (state.useRecords) observeUsage(state, total);
+        }
+        recordContext(session, p.usage);
+      } else if (row.type === "turn_context") {
+        if (hasId(p.turn_id)) turns["#" + p.turn_id] = true;
+        if (hasId(p.model)) session.model = p.model;
+      } else if (row.type === "response_item" && toolItems.has(p.type) && hasId(p.call_id)) {
+        tools["#" + p.call_id] = true;
+      } else if (row.type === "event_msg") {
+        if (p.type === "token_count" && p.info) {
+          const total = p.info.total_token_usage;
+          const consistent = !count(total?.input_tokens) || !count(total?.output_tokens) ||
+            total.total_tokens === total.input_tokens + total.output_tokens;
+          if (!state.useRecords && consistent) observeUsage(state, total);
+          recordContext(session, p.info.last_token_usage, p.info.model_context_window);
+        } else if (p.type === "raw_response_completed" && hasId(p.response_id)) {
+          responses["#" + p.response_id] = true;
+        } else if (p.type === "mcp_tool_call_end" && hasId(p.call_id)) {
+          tools["#" + p.call_id] = true;
+        } else if (p.type === "thread_settings_applied" && (!p.thread_id || p.thread_id === id)) {
+          if (hasId(p.thread_settings?.model)) session.model = p.thread_settings.model;
+        } else if (["task_started", "turn_started", "task_complete", "turn_complete"].includes(p.type)) {
+          if (hasId(p.turn_id)) turns["#" + p.turn_id] = true;
+          if (p.type.endsWith("_complete")) {
+            if (count(p.time_to_first_token_ms)) session.ttftMs = p.time_to_first_token_ms;
+            else delete session.ttftMs;
+          } else {
+            recordContext(session, null, p.model_context_window);
+          }
+        }
+      }
+    },
+    result({ matched, session, turns, responses, tools, pricingModel, ambiguousModel, incompleteUsage }) {
+      if (!matched) return null;
+      const modelCalls = Object.keys(responses).length;
+      return {
+        ...session, turns: Object.keys(turns).length, toolCalls: Object.keys(tools).length,
+        ...(modelCalls && { modelCalls }),
+        ...(!ambiguousModel && !incompleteUsage && pricingModel && { pricingModel }),
+      };
+    },
+  };
+}
+
+async function findRollout(dir, id) {
+  const entries = await fs.readdir(dir, { withFileTypes: true }).catch(() => []);
+  // Search recent dated directories first. Match the UUID, never the working directory.
+  entries.sort((a, b) => a.name < b.name ? 1 : a.name > b.name ? -1 : 0);
+  for (const entry of entries) {
+    const file = path.join(dir, entry.name);
+    if (entry.isDirectory() && /^\d{2,4}$/.test(entry.name)) {
+      const found = await findRollout(file, id);
+      if (found) return found;
+    } else if (entry.isFile() && rolloutName.exec(entry.name)?.[1].toLowerCase() === id) {
+      return file;
+    }
+  }
+  return null;
+}
+
+async function sample({ terminal, sessionId, appHome,
+  home = process.env.CODEX_HOME || path.join(os.homedir(), ".codex") } = {}) {
+  if (!terminal || typeof sessionId !== "string" || !uuid.test(sessionId)) return { session: null };
+  const id = sessionId.toLowerCase();
+  const locate = async cached => {
+    if (cached && (await fs.stat(cached).catch(() => null))?.isFile()) {
+      // A rollback can create a replacement rollout with the same thread ID.
+      return await findRollout(path.dirname(cached), id) || cached;
+    }
+    return await findRollout(path.join(home, "sessions"), id) ||
+      await findRollout(path.join(home, "archived_sessions"), id);
+  };
+  return await summarizeLog("codex", locate, JSON.stringify([terminal, id]), appHome, reducer(id))
+    .catch(() => null) || { session: null };
+}
+
+async function requestQuota(id) {
   const child = spawn("codex", ["app-server"], {
     stdio: ["pipe", "pipe", "ignore"], windowsHide: true,
   });
@@ -122,7 +210,26 @@ async function collect({ sessionId } = {}) {
   lines.close();
   child.stdin.destroy();
   child.kill();
-  return { windows: quotaWindows(limits), session: await readSession(thread, id) };
+  return { windows: quotaWindows(limits), thread };
 }
 
-module.exports = { collect, quotaWindows, readSession };
+async function quota() {
+  const { windows } = await requestQuota(null);
+  return { windows };
+}
+
+// Preserve the combined collector entry point for existing helper callers.
+async function collect(options = {}) {
+  const id = typeof options.sessionId === "string" && uuid.test(options.sessionId) ? options.sessionId : null;
+  const [{ windows, thread }, local] = await Promise.all([requestQuota(id), sample(options)]);
+  let session = local.session;
+  if (!session && id && thread?.id === id) {
+    const fallback = thread.path && await summarizeLog("codex", thread.path,
+      JSON.stringify([options.terminal, id]), options.appHome, reducer(id)).catch(() => null);
+    session = fallback?.session || { id };
+    if (!session.model && typeof thread.model === "string") session.model = thread.model;
+  }
+  return { windows, session };
+}
+
+module.exports = { collect, quota, sample, quotaWindows };
